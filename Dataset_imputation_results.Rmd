@@ -1,0 +1,139 @@
+---
+title: "correlation"
+output: html_document
+date: "2025-04-21"
+---
+```{r}
+# Load required libraries
+library(dplyr)
+library(purrr)
+library(mice)
+library(stats)
+library(spdep)
+library(spatialreg)
+library(openxlsx)
+library(ggplot2)
+library(sf)
+library(truncnorm)
+library(psych)
+library(Hmisc)
+library(tidyr)
+
+# Read shapefile and data
+shapefile_path <- "C:/Users/riamu/OneDrive/Desktop/Personal Thesis work/Final AZ wide analysis file/PCA shp/Primary_Care_Areas.shp"
+pca_shap <- st_read(shapefile_path)
+PrimCareData <- read.csv("C:/Users/riamu/OneDrive/Desktop/Personal Thesis work/Reanalyzing/full datasets/Data for Imputation.csv")
+
+# Merge and clean
+pca_data <- left_join(pca_shap, PrimCareData, by = "PCA_ID") %>%
+  select(-c(PCA_Proper, PCA, UrbanArea, County, Tribal, SqMiles, Pop2010:Pop2017_1, Shape__Are, Shape__Len))
+
+# Prepare subset for imputation
+prcr_ardat <- PrimCareData %>%
+  select(PCA_ID, pct_Male, pct_54to65, pct_65plus, pct_Black, pct_asian, pct_otherRace,  
+         pct_hisplat, pct_LsHS, pct_Service, pct_personalCare, RANGE, MeanLST, tot_pcapop, HM)
+
+
+# Replace <6 values with NA and convert HM to numeric
+prcr_ardat$HM[prcr_ardat$HM == "<6"] <- NA
+prcr_ardat$HM <- as.numeric(prcr_ardat$HM)
+
+# Scale all numeric predictors except ID and outcome
+vars_to_scale <- c("pct_Male", "pct_54to65", "pct_65plus", "pct_Black", "pct_asian", 
+                   "pct_otherRace", "pct_hisplat", "pct_LsHS", "pct_Service", 
+                   "pct_personalCare", "RANGE", "MeanLST")
+
+prcr_ardat_scaled <- prcr_ardat
+
+# Apply scaling to selected columns and convert to numeric vectors
+prcr_ardat_scaled[vars_to_scale] <- lapply(prcr_ardat[vars_to_scale], function(x) as.numeric(scale(x)))
+
+
+# Custom truncated normal imputation
+mice.impute.truncnorm_1_5 <- function(y, ry, x, lower = 1, upper = 5, ...) {
+  x_df <- as.data.frame(x)
+  obs_df <- x_df[ry, , drop = FALSE]
+  mis_df <- x_df[!ry, , drop = FALSE]
+  fit <- lm(y[ry] ~ ., data = obs_df)
+  pred <- predict(fit, newdata = mis_df)
+  se <- summary(fit)$sigma
+  
+  # Save both predicted values and standard error
+  assign("predicted_HM_values", pred, envir = .GlobalEnv)
+  assign("predicted_HM_se", rep(se, length(pred)), envir = .GlobalEnv)
+  
+  # Return imputed values from truncated normal
+  rtruncnorm(n = nrow(mis_df), a = lower, b = upper, mean = pred, sd = se)
+}
+
+
+# Set up imputation
+meth <- make.method(prcr_ardat_scaled)
+meth["HM"] <- "truncnorm_1_5"
+pred <- make.predictorMatrix(prcr_ardat_scaled)
+pred[, "HM"] <- 0
+pred["HM", ] <- 1
+pred["HM", "PCA_ID"] <- 0
+
+# Run mice
+imp <- mice(prcr_ardat_scaled, method = meth, predictorMatrix = pred, m = 20, maxit = 10, seed = 123)
+
+# Export all predicted values from truncnorm model
+predicted_df <- data.frame(
+  PCA_ID = prcr_ardat_scaled$PCA_ID[is.na(prcr_ardat$HM)],
+  Predicted_HM = predicted_HM_values,
+  Std_Error = predicted_HM_se
+)
+write.csv(predicted_df, "Predicted_HM_Values.csv", row.names = FALSE)
+
+
+# Complete datasets and calculate HMR
+imp_data <- complete(imp, "long", include = TRUE) %>%
+  mutate(HMR = (HM / prcr_ardat$tot_pcapop) * 100000)
+
+# Export all imputations
+wb <- createWorkbook()
+for (i in 1:20) {
+  imputed_sheet <- imp_data[imp_data$.imp == i, ] %>% select(-.imp)
+  addWorksheet(wb, paste0("Imputation_", i))
+  writeData(wb, sheet = paste0("Imputation_", i), imputed_sheet)
+}
+saveWorkbook(wb, file = "HMR_20Imputations9.xlsx", overwrite = TRUE)
+
+# Re-create mids object
+imp_updated <- as.mids(imp_data)
+
+# Running linear model
+fit <- with(imp_updated, lm(HMR ~ pct_Male + pct_54to65 + pct_65plus + pct_Black + pct_asian + 
+                             pct_otherRace + pct_hisplat + pct_LsHS + pct_Service + pct_personalCare + 
+                              RANGE + MeanLST))
+#pooling results                             
+pooled_fit <- pool(fit)
+pooled_summary <- summary(pooled_fit)
+
+# Displaying results with significance values 
+pooled_summary$Significance <- cut(pooled_summary$p.value,
+                                   breaks = c(-Inf, 0.001, 0.01, 0.05, 0.1, Inf),
+                                   labels = c("***", "**", "*", ".", ""))
+colnames(pooled_summary) <- c("Term", "Estimate", "Std_Error", "df", "t_value", "p_value", "Significance")
+write.csv(pooled_summary, "Pooled_Regression_Results9.csv", row.names = FALSE)
+
+# Model metrics for each imputed dataset: Rsq, adj R sq, AIC, BIC, loglikelihood
+completed_data_list <- lapply(1:20, function(i) complete(imp_updated, i))
+metrics_list <- lapply(completed_data_list, function(data) {
+  m <- lm(HMR ~ pct_Male + pct_54to65 + pct_65plus + pct_Black + pct_asian + 
+            pct_otherRace + pct_hisplat + pct_LsHS + pct_Service + pct_personalCare + 
+            RANGE + MeanLST, data = data)
+  list(R_squared = summary(m)$r.squared,
+       Adj_R_squared = summary(m)$adj.r.squared,
+       AIC = AIC(m),
+       BIC = BIC(m),
+       logLik = as.numeric(logLik(m)))
+})
+metrics_df <- do.call(rbind, lapply(metrics_list, as.data.frame))
+avg_metrics <- colMeans(metrics_df)
+write.csv(as.data.frame(avg_metrics), "Pooled_Model_Metrics9.csv", row.names = TRUE)
+
+
+```
+
